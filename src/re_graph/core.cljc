@@ -5,7 +5,8 @@
             [re-graph.logging :as log]
             [clojure.string :as string]
             [clojure.spec.alpha :as s]
-            [re-graph.spec :as spec]))
+            [re-graph.spec :as spec]
+            #?(:clj [cheshire.core :as json])))
 
 ;; queries and mutations
 
@@ -125,6 +126,10 @@
 
 (s/fdef abort :args (s/cat :opts ::spec/abort))
 
+(defn- encode [obj]
+  #?(:cljs (js/JSON.stringify (clj->js obj))
+     :clj (json/encode obj)))
+
 ;; subscriptions
 
 (re-frame/reg-event-fx
@@ -140,11 +145,18 @@
                                                                 :event [::subscribe event]
                                                                 :active? true
                                                                 :legacy? legacy?})
-      ::internals/send-ws [(get-in db [:ws :connection])
-                           {:id (name id)
-                            :type "start"
-                            :payload {:query (str "subscription " (string/replace query #"^subscription\s?" ""))
-                                      :variables variables}}]}
+      ;; subscription-query-as-data? supports subscription query format for AWS AppSync
+      ::internals/send-ws (let [{:keys [subscription-query-as-data? extensions]} (get-in db [:ws :impl])
+                                query {:query     (str "subscription " (string/replace query #"^subscription\s?" ""))
+                                       :variables variables}
+                                payload (if subscription-query-as-data?
+                                          {:data       (encode query)
+                                           :extensions extensions}
+                                          query)]
+                            [(get-in db [:ws :connection])
+                             {:id      (name id)
+                              :type    "start"
+                              :payload payload}])}
 
      (:ws db)
      {:db (update-in db [:ws :queue] conj [::subscribe event])}
