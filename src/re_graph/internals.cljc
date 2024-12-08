@@ -119,7 +119,7 @@
 (re-frame/reg-event-fx
  ::http-complete
  (interceptors)
- (fn [{:keys [db]} {:keys [legacy? id response]}]
+ (fn [{:keys [db]} {:keys [legacy? id response http]}]
    (let [callback (get-in db [:http :requests id :callback])]
      {:db       (-> db
                     (update :subscriptions dissoc id)
@@ -127,7 +127,7 @@
       :dispatch (if (and legacy? ;; enforce legacy behaviour for deprecated api
                          (not= ::callback (first callback)))
                   (conj callback response)
-                  (update callback 1 assoc :response response))})))
+                  (update callback 1 assoc :response response :http http))})))
 
 (re-frame/reg-fx
  ::call-abort
@@ -158,14 +158,20 @@
       :clj (let [future (interop/send-http url
                                            request
                                            (encode payload)
-                                           (fn [{:keys [status body]}]
+                                           (fn [{:keys [status body] :as response}]
                                              (re-frame/dispatch [::http-complete
-                                                                 (assoc event :response (if (unexceptional-status? status)
-                                                                                          body
-                                                                                          (insert-http-status body status)))]))
+                                                                 (-> event
+                                                                     (assoc :response (if (unexceptional-status? status)
+                                                                                        body
+                                                                                        (insert-http-status body status)))
+                                                                     ;; hato response also contains the request
+                                                                     (assoc :http response))]))
                                            (fn [exception]
                                              (let [{:keys [status body]} (ex-data exception)]
-                                               (re-frame/dispatch [::http-complete (assoc event :response (insert-http-status body status))]))))]
+                                               (re-frame/dispatch [::http-complete (-> event
+                                                                                       (assoc :response (insert-http-status body status))
+                                                                                       ;; hato response also contains the request
+                                                                                       (assoc :http (ex-data exception)))]))))]
              (re-frame/dispatch [::register-abort (assoc event :abort-fn #(.cancel future))])))))
 
 (re-frame/reg-fx
@@ -175,16 +181,50 @@
    #?(:cljs (.send websocket (encode payload))
       :clj (interop/send-ws websocket (encode payload)))))
 
+
+(defn max-arity
+  "Returns the maximum arity of:
+ - anonymous functions like `#()` and `(fn [])`.
+ - defined functions like `map` or `+`.
+ - macros, by passing a var like `#'->`.
+
+Returns `:variadic` if the function/macro is variadic.
+ Note - CLJ only"
+  ;; https://stackoverflow.com/a/47861069
+  [f]
+  #?(:cljs 1
+
+     :clj
+     (let [func (if (var? f) @f f)
+           methods (->> func class .getDeclaredMethods
+                        (map #(vector (.getName %)
+                                      (count (.getParameterTypes %)))))
+           var-args? (some #(-> % first #{"getRequiredArity"})
+                           methods)]
+       (if var-args?
+         :variadic
+         (let [max-arity (->> methods
+                              (filter (comp #{"invoke"} first))
+                              (sort-by second)
+                              last
+                              second)]
+           (if (and (var? f) (-> f meta :macro))
+             (- max-arity 2)                                ;; substract implicit &form and &env arguments
+             max-arity))))))
+
 (re-frame/reg-fx
- ::call-callback
- (fn [[callback-fn payload]]
-   (callback-fn payload)))
+  ::call-callback
+  (fn [[callback-fn payload http]]
+    (let [max-arity (max-arity callback-fn)]
+      (case max-arity
+        1 (callback-fn payload)
+        (2 :variadic) (callback-fn payload http)))))
 
 (re-frame/reg-event-fx
  ::callback
  [re-frame/unwrap]
- (fn [_ {:keys [callback-fn response]}]
-   {::call-callback [callback-fn response]}))
+ (fn [_ {:keys [callback-fn response http]}]
+   {::call-callback [callback-fn response http]}))
 
 (re-frame/reg-event-fx
  ::on-ws-data
